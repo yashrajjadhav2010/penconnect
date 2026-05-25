@@ -147,7 +147,7 @@ export default function App() {
     // 2. HTTP Server Sync fallback (100% reliable, works across iframes, NATs, and networks)
     if (activePin) {
       try {
-        await fetch('/api/sync/send', {
+        await fetch('api/sync/send', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
@@ -314,7 +314,7 @@ export default function App() {
           pollInterval = null;
         }
 
-        const streamUrl = `/api/sync/stream?pin=${activePin}&client=${deviceMode}`;
+        const streamUrl = `api/sync/stream?pin=${activePin}&client=${deviceMode}`;
         eventSource = new EventSource(streamUrl);
 
         eventSource.onopen = () => {
@@ -358,7 +358,7 @@ export default function App() {
       pollInterval = setInterval(async () => {
         if (!active) return;
         try {
-          const res = await fetch(`/api/sync/poll-data?pin=${activePin}&lastId=${lastCheckedMessageId}&client=${deviceMode}`);
+          const res = await fetch(`api/sync/poll-data?pin=${activePin}&lastId=${lastCheckedMessageId}&client=${deviceMode}`);
           if (!res.ok) return;
           const data = await res.json();
           if (data.messages && data.messages.length > 0) {

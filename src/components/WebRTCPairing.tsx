@@ -148,12 +148,16 @@ export default function WebRTCPairing({
       setConnectionState('init-host');
       setPairingError(null);
 
-      const pc = new RTCPeerConnection(rtcConfig);
+       const pc = new RTCPeerConnection(rtcConfig);
       peerConnectionRef.current = pc;
 
       // Handle connection state indicators with fallback WebRTC checks
       const checkConnection = () => {
         console.log('Host connection state change:', pc.connectionState, pc.iceConnectionState);
+        // Ensure remote description is applied before trusting any 'connected' transition
+        if (!pc.remoteDescription) {
+          return;
+        }
         if (pc.connectionState === 'connected' || pc.iceConnectionState === 'connected') {
           setConnectionState('connected');
           if (pollIntervalRef.current) {
@@ -214,7 +218,7 @@ export default function WebRTCPairing({
 
         // Post offer to backing API to procure a 4-digit PIN!
         try {
-          const res = await fetch('/api/pair/create', {
+          const res = await fetch('api/pair/create', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ offer: signalText }),
@@ -231,11 +235,13 @@ export default function WebRTCPairing({
             startPolling(data.pin);
           } else {
             console.warn('Invalid API PIN response; falling back to manual.');
+            setPairingError('Generated PIN was empty from pairing server. Swapped to manual sync.');
             setUseBackupManualMode(true);
           }
-        } catch (err) {
+        } catch (err: any) {
           console.error('Failed to obtain pairing PIN:', err);
           // Let them copy/scan manually if backend cannot be reached or is pure offline
+          setPairingError(`Cannot reach pairing server to generate PIN: ${err.message || err}. Swapped to manual backup.`);
           setUseBackupManualMode(true);
         }
       }
@@ -253,7 +259,7 @@ export default function WebRTCPairing({
 
     pollIntervalRef.current = setInterval(async () => {
       try {
-        const res = await fetch(`/api/pair/poll?pin=${pairingPin}`);
+        const res = await fetch(`api/pair/poll?pin=${pairingPin}`);
         if (!res.ok) return;
 
         const data = await res.json();
@@ -308,7 +314,7 @@ export default function WebRTCPairing({
 
     try {
       // 1. Download Laptop's Offer by PIN
-      const res = await fetch(`/api/pair/get?pin=${trimmedPin}`);
+      const res = await fetch(`api/pair/get?pin=${trimmedPin}`);
       if (!res.ok) {
         throw new Error('Incorrect, expired, or non-active PIN. Please verify the code displayed on your Laptop.');
       }
@@ -329,6 +335,9 @@ export default function WebRTCPairing({
 
       const checkConnection = () => {
         console.log('Joiner connection state change:', pc.connectionState, pc.iceConnectionState);
+        if (!pc.remoteDescription) {
+          return;
+        }
         if (pc.connectionState === 'connected' || pc.iceConnectionState === 'connected') {
           setConnectionState('connected');
         } else if (pc.connectionState === 'failed' || pc.iceConnectionState === 'failed') {
@@ -392,7 +401,7 @@ export default function WebRTCPairing({
         });
         setLocalSignal(signalText);
 
-        const replyRes = await fetch('/api/pair/answer', {
+        const replyRes = await fetch('api/pair/answer', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ pin: trimmedPin, answer: signalText }),
@@ -427,6 +436,9 @@ export default function WebRTCPairing({
 
       const checkConnection = () => {
         console.log('Joiner connection state change:', pc.connectionState, pc.iceConnectionState);
+        if (!pc.remoteDescription) {
+          return;
+        }
         if (pc.connectionState === 'connected' || pc.iceConnectionState === 'connected') {
           setConnectionState('connected');
         } else if (pc.connectionState === 'failed' || pc.iceConnectionState === 'failed') {
