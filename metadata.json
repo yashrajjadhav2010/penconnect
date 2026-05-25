@@ -1,0 +1,6 @@
+{
+  "name": "Handwriting Sync",
+  "description": "A completely frontend-only real-time peer-to-peer handwriting synchronizer for tablets and laptops, optimized for offline local study.",
+  "requestFramePermissions": ["camera"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
