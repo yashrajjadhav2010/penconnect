@@ -7,10 +7,19 @@ import express from 'express';
 import path from 'path';
 import { createServer as createViteServer } from 'vite';
 
+interface SyncMessage {
+  id: number;
+  data: any;
+  sender: string;
+}
+
 interface PairingSession {
   offer: string;
   answer?: string;
   createdAt: number;
+  messages: SyncMessage[];
+  messageIdCounter: number;
+  listeners: ((msg: SyncMessage) => void)[];
 }
 
 async function startServer() {
@@ -56,7 +65,10 @@ async function startServer() {
 
     sessions.set(pin, {
       offer,
-      createdAt: Date.now()
+      createdAt: Date.now(),
+      messages: [],
+      messageIdCounter: 0,
+      listeners: []
     });
 
     console.log(`[Pairing] Created session for PIN ${pin}`);
@@ -112,6 +124,126 @@ async function startServer() {
     } else {
       res.json({ status: 'waiting' });
     }
+  });
+
+  // Send real-time synchronized handwriting messages
+  app.post('/api/sync/send', (req, res) => {
+    const { pin, sender, message } = req.body;
+    if (!pin || !message) {
+      return res.status(400).json({ error: 'PIN and message are required' });
+    }
+
+    const session = sessions.get(pin);
+    if (!session) {
+      return res.status(404).json({ error: 'Session not found or expired' });
+    }
+
+    if (!session.messages) session.messages = [];
+    if (!session.listeners) session.listeners = [];
+    if (session.messageIdCounter === undefined) session.messageIdCounter = 0;
+
+    session.messageIdCounter++;
+    const syncMsg: SyncMessage = {
+      id: session.messageIdCounter,
+      data: message,
+      sender: sender || 'unknown'
+    };
+
+    // Store in historical message buffer for polling recovery
+    session.messages.push(syncMsg);
+    // Limit buffer to last 100 messages to prevent memory leak
+    if (session.messages.length > 100) {
+      session.messages.shift();
+    }
+
+    // Trigger SSE listeners instantly
+    for (const listener of session.listeners) {
+      try {
+        listener(syncMsg);
+      } catch (err) {
+        console.error('Error in SSE listener:', err);
+      }
+    }
+
+    res.json({ success: true, messageId: syncMsg.id });
+  });
+
+  // Real-time server-sent events stream
+  app.get('/api/sync/stream', (req, res) => {
+    const pin = req.query.pin as string;
+    const clientType = req.query.client as string || 'unknown';
+    if (!pin) {
+      return res.status(400).send('PIN is required');
+    }
+
+    const session = sessions.get(pin);
+    if (!session) {
+      return res.status(440).send('Session not found or expired');
+    }
+
+    if (!session.messages) session.messages = [];
+    if (!session.listeners) session.listeners = [];
+
+    // Set headers for Server-Sent Events
+    res.writeHead(200, {
+      'Content-Type': 'text/event-stream',
+      'Cache-Control': 'no-cache',
+      'Connection': 'keep-alive',
+      'X-Accel-Buffering': 'no', // Disable buffering in reverse proxy
+    });
+
+    // Send initial connection message/keepalive
+    res.write(`data: ${JSON.stringify({ type: 'connected', pin })}\n\n`);
+
+    const listener = (msg: SyncMessage) => {
+      // Don't send back to the sender
+      if (msg.sender !== clientType) {
+        res.write(`data: ${JSON.stringify(msg.data)}\n\n`);
+      }
+    };
+
+    session.listeners.push(listener);
+
+    // Keepalive ping every 10 seconds to bypass proxy timeouts
+    const keepAliveInterval = setInterval(() => {
+      res.write(': keepalive\n\n');
+    }, 10000);
+
+    req.on('close', () => {
+      clearInterval(keepAliveInterval);
+      if (sessions.has(pin)) {
+        const s = sessions.get(pin);
+        if (s && s.listeners) {
+          s.listeners = s.listeners.filter(l => l !== listener);
+        }
+      }
+    });
+  });
+
+  // Fast HTTP poll as fallback for stream disruption
+  app.get('/api/sync/poll-data', (req, res) => {
+    const pin = req.query.pin as string;
+    const lastIdStr = req.query.lastId as string;
+    const clientType = req.query.client as string || 'unknown';
+
+    if (!pin) {
+      return res.status(400).json({ error: 'PIN is required' });
+    }
+
+    const session = sessions.get(pin);
+    if (!session) {
+      return res.status(444).json({ error: 'Session not found or expired' });
+    }
+
+    if (!session.messages) session.messages = [];
+
+    const lastId = lastIdStr ? parseInt(lastIdStr, 10) : 0;
+    const newMessages = session.messages.filter(msg => msg.id > lastId && msg.sender !== clientType);
+
+    res.json({
+      messages: newMessages.map(msg => msg.data),
+      lastId: session.messages.length > 0 ? session.messages[session.messages.length - 1].id : lastId
+    });
   });
 
   // Vite middleware for development

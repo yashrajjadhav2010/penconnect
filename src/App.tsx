@@ -73,6 +73,7 @@ export default function App() {
   const [connectionState, setConnectionState] = useState<ConnectionState>('idle');
   const peerConnectionRef = useRef<RTCPeerConnection | null>(null);
   const dataChannelRef = useRef<RTCDataChannel | null>(null);
+  const [activePin, setActivePin] = useState<string>('');
 
   // States
   const [strokes, setStrokes] = useState<Stroke[]>([]);
@@ -98,6 +99,17 @@ export default function App() {
   const [connectionLatency, setConnectionLatency] = useState<number | null>(null);
   const pingIntervalRef = useRef<number | null>(null);
 
+  // Refs to prevent state closure staleness in EventSource/polling listeners
+  const strokesRef = useRef(strokes);
+  const undoStackRef = useRef(undoStack);
+  const redoStackRef = useRef(redoStack);
+
+  useEffect(() => {
+    strokesRef.current = strokes;
+    undoStackRef.current = undoStack;
+    redoStackRef.current = redoStack;
+  }, [strokes, undoStack, redoStack]);
+
   // Clean resources on unmount
   useEffect(() => {
     return () => {
@@ -120,17 +132,139 @@ export default function App() {
     }
   }, [currentTool]);
 
-  // Sync state emitter helper
-  const sendSyncState = () => {
+  // Common message broadcasting pipeline via BOTH WebRTC or reliable Server HTTPSync
+  const broadcastMessage = async (msg: PeerMessage) => {
+    // 1. WebRTC direct low-latency send (if open)
     const dc = dataChannelRef.current;
     if (dc && dc.readyState === 'open') {
-      const msg: PeerMessage = {
-        type: 'sync-state',
-        strokes,
-        undoStack,
-        redoStack,
-      };
-      dc.send(JSON.stringify(msg));
+      try {
+        dc.send(JSON.stringify(msg));
+      } catch (err) {
+        console.warn('[WebRTC] sync channel write error:', err);
+      }
+    }
+
+    // 2. HTTP Server Sync fallback (100% reliable, works across iframes, NATs, and networks)
+    if (activePin) {
+      try {
+        await fetch('/api/sync/send', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            pin: activePin,
+            sender: deviceMode,
+            message: msg
+          })
+        });
+      } catch (err) {
+        console.error('[HTTP Sync] Post message failed:', err);
+      }
+    }
+  };
+
+  // Sync state emitter helper
+  const sendSyncState = () => {
+    broadcastMessage({
+      type: 'sync-state',
+      strokes: strokesRef.current,
+      undoStack: undoStackRef.current,
+      redoStack: redoStackRef.current,
+    });
+  };
+
+  // Unpack and process standard sync drawing events
+  const handleIncomingMessage = (msg: PeerMessage) => {
+    switch (msg.type) {
+      case 'sync-request':
+        // Tablet receives this from Laptop. Emit full state.
+        if (deviceMode === 'tablet') {
+          broadcastMessage({
+            type: 'sync-state',
+            strokes: strokesRef.current,
+            undoStack: undoStackRef.current,
+            redoStack: redoStackRef.current,
+          });
+        }
+        break;
+
+      case 'sync-state':
+        // Laptop viewer receives full strokes dump
+        if (deviceMode === 'laptop') {
+          setStrokes(msg.strokes);
+          setUndoStack(msg.undoStack);
+          setRedoStack(msg.redoStack);
+        }
+        break;
+
+      case 'draw-start':
+        if (deviceMode === 'laptop') {
+          setActiveIncomingStrokes((prev) => ({
+            ...prev,
+            [msg.stroke.id]: msg.stroke,
+          }));
+        }
+        break;
+
+      case 'draw-points':
+        if (deviceMode === 'laptop') {
+          setActiveIncomingStrokes((prev) => {
+            const target = prev[msg.id];
+            if (!target) return prev;
+            return {
+              ...prev,
+              [msg.id]: {
+                ...target,
+                points: [...target.points, ...msg.points],
+              },
+            };
+          });
+        }
+        break;
+
+      case 'draw-end':
+        if (deviceMode === 'laptop') {
+          setActiveIncomingStrokes((prev) => {
+            const finishedStroke = prev[msg.id];
+            if (finishedStroke) {
+              setStrokes((current) => [...current, finishedStroke]);
+            }
+            const copy = { ...prev };
+            delete copy[msg.id];
+            return copy;
+          });
+        }
+        break;
+
+      case 'undo':
+        if (deviceMode === 'laptop') {
+          handleUndoLocal();
+        }
+        break;
+
+      case 'redo':
+        if (deviceMode === 'laptop') {
+          handleRedoLocal();
+        }
+        break;
+
+      case 'clear':
+        if (deviceMode === 'laptop') {
+          handleClearLocal();
+        }
+        break;
+
+      case 'ping':
+        // Echo back pong instantly if we can
+        const dc = dataChannelRef.current;
+        if (dc && dc.readyState === 'open') {
+          dc.send(JSON.stringify({ type: 'pong', time: msg.time }));
+        }
+        break;
+
+      case 'pong':
+        const rtt = Date.now() - msg.time;
+        setConnectionLatency(rtt);
+        break;
     }
   };
 
@@ -139,98 +273,7 @@ export default function App() {
     dc.onmessage = (event) => {
       try {
         const msg = JSON.parse(event.data) as PeerMessage;
-        
-        switch (msg.type) {
-          case 'sync-request':
-            // Tablet receives this from Laptop after handshake opens. Respond with full notes cache!
-            if (deviceMode === 'tablet') {
-              const reply: PeerMessage = {
-                type: 'sync-state',
-                strokes,
-                undoStack,
-                redoStack,
-              };
-              dc.send(JSON.stringify(reply));
-            }
-            break;
-
-          case 'sync-state':
-            // Laptop viewer receives full strokes dump
-            if (deviceMode === 'laptop') {
-              setStrokes(msg.strokes);
-              setUndoStack(msg.undoStack);
-              setRedoStack(msg.redoStack);
-            }
-            break;
-
-          case 'draw-start':
-            if (deviceMode === 'laptop') {
-              setActiveIncomingStrokes((prev) => ({
-                ...prev,
-                [msg.stroke.id]: msg.stroke,
-              }));
-            }
-            break;
-
-          case 'draw-points':
-            if (deviceMode === 'laptop') {
-              setActiveIncomingStrokes((prev) => {
-                const target = prev[msg.id];
-                if (!target) return prev;
-                return {
-                  ...prev,
-                  [msg.id]: {
-                    ...target,
-                    points: [...target.points, ...msg.points],
-                  },
-                };
-              });
-            }
-            break;
-
-          case 'draw-end':
-            if (deviceMode === 'laptop') {
-              setActiveIncomingStrokes((prev) => {
-                const finishedStroke = prev[msg.id];
-                if (finishedStroke) {
-                  setStrokes((current) => [...current, finishedStroke]);
-                }
-                const copy = { ...prev };
-                delete copy[msg.id];
-                return copy;
-              });
-            }
-            break;
-
-          case 'undo':
-            if (deviceMode === 'laptop') {
-              handleUndoLocal();
-            }
-            break;
-
-          case 'redo':
-            if (deviceMode === 'laptop') {
-              handleRedoLocal();
-            }
-            break;
-
-          case 'clear':
-            if (deviceMode === 'laptop') {
-              handleClearLocal();
-            }
-            break;
-
-          case 'ping':
-            // Echo back pong instantly
-            dc.send(JSON.stringify({ type: 'pong', time: msg.time }));
-            break;
-
-          case 'pong':
-            const now = Date.now();
-            const rtt = now - msg.time;
-            setConnectionLatency(rtt);
-            break;
-        }
+        handleIncomingMessage(msg);
       } catch (err) {
         console.error('Failed to handle incoming WebRTC message:', err);
       }
@@ -240,8 +283,7 @@ export default function App() {
     if (pingIntervalRef.current) clearInterval(pingIntervalRef.current);
     pingIntervalRef.current = window.setInterval(() => {
       if (dc.readyState === 'open') {
-        const pingMsg: PeerMessage = { type: 'ping', time: Date.now() };
-        dc.send(JSON.stringify(pingMsg));
+        dc.send(JSON.stringify({ type: 'ping', time: Date.now() }));
       } else {
         if (pingIntervalRef.current) {
           clearInterval(pingIntervalRef.current);
@@ -250,12 +292,106 @@ export default function App() {
       }
     }, 4500);
 
-    // If we are Laptop (Host), request an introductory notes synchronization state dump
+    // If we are Laptop, request sync
     if (deviceMode === 'laptop') {
-      const syncReq: PeerMessage = { type: 'sync-request' };
-      dc.send(JSON.stringify(syncReq));
+      broadcastMessage({ type: 'sync-request' });
     }
   };
+
+  // Real-time synchronization stream (SSE + Polling Fallback)
+  useEffect(() => {
+    if (!activePin || deviceMode === 'unselected') return;
+
+    let eventSource: EventSource | null = null;
+    let pollInterval: any = null;
+    let active = true;
+    let lastCheckedMessageId = 0;
+
+    const startEventStream = () => {
+      try {
+        if (pollInterval) {
+          clearInterval(pollInterval);
+          pollInterval = null;
+        }
+
+        const streamUrl = `/api/sync/stream?pin=${activePin}&client=${deviceMode}`;
+        eventSource = new EventSource(streamUrl);
+
+        eventSource.onopen = () => {
+          console.log('[SSE] Stream established with PIN:', activePin);
+        };
+
+        eventSource.onmessage = (event) => {
+          if (!active) return;
+          try {
+            const raw = JSON.parse(event.data);
+            if (raw && raw.type) {
+              handleIncomingMessage(raw);
+            }
+          } catch (err) {
+            // keep-alive or empty payload
+          }
+        };
+
+        eventSource.onerror = (err) => {
+          console.warn('[SSE] Stream error, falling back to fast polling in 2 seconds:', err);
+          if (eventSource) {
+            eventSource.close();
+            eventSource = null;
+          }
+          if (active) {
+            setTimeout(() => {
+              if (active) startPolling();
+            }, 2000);
+          }
+        };
+      } catch (err) {
+        console.error('[SSE] Failed to construct EventSource, falling back to polling:', err);
+        startPolling();
+      }
+    };
+
+    const startPolling = () => {
+      if (pollInterval) return;
+      console.log('[Poll] Starting fallback HTTP sync polling...');
+
+      pollInterval = setInterval(async () => {
+        if (!active) return;
+        try {
+          const res = await fetch(`/api/sync/poll-data?pin=${activePin}&lastId=${lastCheckedMessageId}&client=${deviceMode}`);
+          if (!res.ok) return;
+          const data = await res.json();
+          if (data.messages && data.messages.length > 0) {
+            data.messages.forEach((msg: PeerMessage) => {
+              handleIncomingMessage(msg);
+            });
+          }
+          if (data.lastId) {
+            lastCheckedMessageId = data.lastId;
+          }
+        } catch (err) {
+          console.error('[Poll] Sync error:', err);
+        }
+      }, 1000);
+    };
+
+    startEventStream();
+
+    // Laptop requests immediate drawing pad notes
+    if (deviceMode === 'laptop') {
+      broadcastMessage({ type: 'sync-request' });
+    }
+
+    return () => {
+      active = false;
+      if (eventSource) {
+        eventSource.close();
+      }
+      if (pollInterval) {
+        clearInterval(pollInterval);
+      }
+    };
+  }, [activePin, deviceMode]);
 
   // -------------------------------------------------------------
   // LOCAL DRAWING EVENT FLOWS (On Tablet Device)
@@ -265,20 +401,12 @@ export default function App() {
     setRedoStack([]);
     setUndoStack((prev) => [...prev, strokes]);
 
-    // 2. Clear out active incoming states
-    const dc = dataChannelRef.current;
-    if (dc && dc.readyState === 'open') {
-      const msg: PeerMessage = { type: 'draw-start', stroke: newStroke };
-      dc.send(JSON.stringify(msg));
-    }
+    // 2. Broadcast write event
+    broadcastMessage({ type: 'draw-start', stroke: newStroke });
   };
 
   const handleStrokePointsAdd = (strokeId: string, newPoints: Point[]) => {
-    const dc = dataChannelRef.current;
-    if (dc && dc.readyState === 'open') {
-      const msg: PeerMessage = { type: 'draw-points', id: strokeId, points: newPoints };
-      dc.send(JSON.stringify(msg));
-    }
+    broadcastMessage({ type: 'draw-points', id: strokeId, points: newPoints });
   };
 
   const handleStrokeEnd = (completedStroke: Stroke) => {
@@ -286,11 +414,7 @@ export default function App() {
     setStrokes((current) => [...current, completedStroke]);
 
     // Notify Peer that drawing of this stroke completed
-    const dc = dataChannelRef.current;
-    if (dc && dc.readyState === 'open') {
-      const msg: PeerMessage = { type: 'draw-end', id: completedStroke.id };
-      dc.send(JSON.stringify(msg));
-    }
+    broadcastMessage({ type: 'draw-end', id: completedStroke.id });
   };
 
   // Erasing strokes handler
@@ -303,16 +427,12 @@ export default function App() {
     setStrokes(updated);
 
     // Sync updated drawing deck directly to viewer
-    const dc = dataChannelRef.current;
-    if (dc && dc.readyState === 'open') {
-      const msg: PeerMessage = {
-        type: 'sync-state',
-        strokes: updated,
-        undoStack,
-        redoStack,
-      };
-      dc.send(JSON.stringify(msg));
-    }
+    broadcastMessage({
+      type: 'sync-state',
+      strokes: updated,
+      undoStack: undoStackRef.current,
+      redoStack: redoStackRef.current,
+    });
   };
 
   // -------------------------------------------------------------
@@ -329,10 +449,7 @@ export default function App() {
   const handleUndoEmit = () => {
     if (undoStack.length === 0) return;
     handleUndoLocal();
-    const dc = dataChannelRef.current;
-    if (dc && dc.readyState === 'open') {
-      dc.send(JSON.stringify({ type: 'undo' }));
-    }
+    broadcastMessage({ type: 'undo' });
   };
 
   const handleRedoLocal = () => {
@@ -346,10 +463,7 @@ export default function App() {
   const handleRedoEmit = () => {
     if (redoStack.length === 0) return;
     handleRedoLocal();
-    const dc = dataChannelRef.current;
-    if (dc && dc.readyState === 'open') {
-      dc.send(JSON.stringify({ type: 'redo' }));
-    }
+    broadcastMessage({ type: 'redo' });
   };
 
   const handleClearLocal = () => {
@@ -361,10 +475,7 @@ export default function App() {
 
   const handleClearEmit = () => {
     handleClearLocal();
-    const dc = dataChannelRef.current;
-    if (dc && dc.readyState === 'open') {
-      dc.send(JSON.stringify({ type: 'clear' }));
-    }
+    broadcastMessage({ type: 'clear' });
   };
 
   // Multi-viewport calibration: auto-fit zoom and center to encompass all drawings
@@ -558,6 +669,7 @@ export default function App() {
     setConnectionLatency(null);
     setConnectionState('idle');
     setDeviceMode('unselected');
+    setActivePin('');
     setStrokes([]);
     setUndoStack([]);
     setRedoStack([]);
@@ -575,6 +687,8 @@ export default function App() {
         peerConnectionRef={peerConnectionRef}
         dataChannelRef={dataChannelRef}
         onDataChannelReady={handleDataChannelReady}
+        activePin={activePin}
+        setActivePin={setActivePin}
       />
     );
   }

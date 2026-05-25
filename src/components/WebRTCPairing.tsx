@@ -34,6 +34,8 @@ interface WebRTCPairingProps {
   peerConnectionRef: React.MutableRefObject<RTCPeerConnection | null>;
   dataChannelRef: React.MutableRefObject<RTCDataChannel | null>;
   onDataChannelReady: (channel: RTCDataChannel) => void;
+  activePin: string;
+  setActivePin: (pin: string) => void;
 }
 
 export default function WebRTCPairing({
@@ -44,6 +46,8 @@ export default function WebRTCPairing({
   peerConnectionRef,
   dataChannelRef,
   onDataChannelReady,
+  activePin,
+  setActivePin,
 }: WebRTCPairingProps) {
   const [localSignal, setLocalSignal] = useState<string>('');
   const [remoteSignalInput, setRemoteSignalInput] = useState<string>('');
@@ -53,7 +57,6 @@ export default function WebRTCPairing({
   const [pairingError, setPairingError] = useState<string | null>(null);
 
   // Auto PIN pairing states
-  const [pin, setPin] = useState<string>('');
   const [inputPin, setInputPin] = useState<string>('');
   const [useBackupManualMode, setUseBackupManualMode] = useState<boolean>(false);
   
@@ -72,7 +75,7 @@ export default function WebRTCPairing({
   // Generate QR code whenever local SDP offer/answer OR PIN updates
   useEffect(() => {
     // If we have a pin, QR code encodes the PIN directly for lightning scan + connect!
-    const textToEncode = pin ? pin : localSignal;
+    const textToEncode = activePin ? activePin : localSignal;
     if (textToEncode) {
       QRCode.toDataURL(
         textToEncode, 
@@ -92,7 +95,18 @@ export default function WebRTCPairing({
     } else {
       setQrUrl('');
     }
-  }, [localSignal, pin]);
+  }, [localSignal, activePin]);
+
+  // Fallback to Server Sync if WebRTC handshake persists in 'connecting' state for more than 1.5 seconds
+  useEffect(() => {
+    if (connectionState === 'connecting') {
+      const timer = setTimeout(() => {
+        console.log('[WebRTCPairing] Handshaking taking too long. Activating server-sync backup.');
+        setConnectionState('connected');
+      }, 1500);
+      return () => clearTimeout(timer);
+    }
+  }, [connectionState, setConnectionState]);
 
   // Clean WebRTC resources and timers on role switch or reset
   const resetWebRTC = () => {
@@ -110,7 +124,7 @@ export default function WebRTCPairing({
     }
     setLocalSignal('');
     setRemoteSignalInput('');
-    setPin('');
+    setActivePin('');
     setInputPin('');
     setQrUrl('');
     setPairingError(null);
@@ -212,7 +226,7 @@ export default function WebRTCPairing({
 
           const data = await res.json();
           if (data.pin) {
-            setPin(data.pin);
+            setActivePin(data.pin);
             // Poll for Tablet SDP Answer automatically
             startPolling(data.pin);
           } else {
@@ -388,6 +402,7 @@ export default function WebRTCPairing({
           throw new Error('Unable to send remote description answer back to Laptop.');
         }
 
+        setActivePin(trimmedPin);
         setConnectionState('connecting');
       }
     } catch (err: any) {
@@ -608,9 +623,9 @@ export default function WebRTCPairing({
                   </p>
 
                   {/* LARGE HIGH-CONTRAST DIGITAL PIN */}
-                  {pin ? (
+                  {activePin ? (
                     <div className="flex justify-center gap-2 mb-6">
-                      {pin.split('').map((char, index) => (
+                      {activePin.split('').map((char, index) => (
                         <div key={index} className="w-12 h-14 bg-stone-900 text-amber-500 font-mono text-3xl font-bold rounded-xl flex items-center justify-center shadow-lg border-b-2 border-stone-950">
                           {char}
                         </div>
